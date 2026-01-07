@@ -351,6 +351,9 @@ app.post('/api/send-confirmation', async (req, res) => {
       formattedDate = date;
     }
     
+    // Format time as HH:MM (remove seconds if present)
+    const formattedTime = time ? time.substring(0, 5) : '';
+    
     const result = await sendWhatsAppMessage(
       phone,
       TWILIO_CONFIG.confirmationTemplateSid,
@@ -358,7 +361,7 @@ app.post('/api/send-confirmation', async (req, res) => {
         "1": String(clientName),
         "2": String(businessName),
         "3": String(formattedDate),
-        "4": String(time)
+        "4": String(formattedTime)
       }
     );
     
@@ -577,6 +580,8 @@ async function processBusinessReminders(business) {
     
     try {
       const formattedDate = format(parseISO(booking.date), 'd בMMMM', { locale: he });
+      // Format time as HH:MM (remove seconds if present)
+      const formattedTime = booking.time.substring(0, 5);
       
       await sendWhatsAppMessage(
         booking.client_phone,
@@ -585,7 +590,7 @@ async function processBusinessReminders(business) {
           "1": booking.client_name || 'לקוח יקר',
           "2": business.name,
           "3": formattedDate,
-          "4": booking.time
+          "4": formattedTime
         }
       );
       
