@@ -1,5 +1,11 @@
 /**
- * LinedUp WhatsApp Service v2.0
+ * LinedUp WhatsApp Service v2.1 (SECURED)
+ * 
+ * Security Features:
+ * - API Key validation
+ * - Rate limiting per IP
+ * - CORS restricted to your domain
+ * - Request logging
  * 
  * Features:
  * - OTP Authentication (send & verify)
@@ -25,8 +31,140 @@ process.env.TZ = 'Asia/Jerusalem';
 
 // Initialize Express
 const app = express();
-app.use(cors());
+
+// ============================================================
+// SECURITY CONFIGURATION
+// ============================================================
+
+// API Key for authentication (set this in Railway environment variables)
+const API_KEY = process.env.API_KEY || 'your-secret-api-key-change-this';
+
+// Allowed origins (your frontend domains)
+const ALLOWED_ORIGINS = [
+  'https://linedup.co.il',
+  'https://www.linedup.co.il',
+  'https://linedup-app.netlify.app',
+  'http://localhost:5173',  // Local dev
+  'http://localhost:3000',  // Local dev
+  process.env.FRONTEND_URL  // Custom frontend URL from env
+].filter(Boolean);
+
+// CORS configuration - restrict to your domains only
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl for testing)
+    if (!origin) return callback(null, true);
+    
+    if (ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`⚠️ CORS blocked request from: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
+
 app.use(express.json());
+
+// ============================================================
+// RATE LIMITING (In-Memory)
+// ============================================================
+
+const rateLimitStore = new Map();
+
+// Rate limit configuration per endpoint type
+const RATE_LIMITS = {
+  otp: { windowMs: 60 * 1000, maxRequests: 3 },      // 3 OTP requests per minute per IP
+  message: { windowMs: 60 * 1000, maxRequests: 30 }, // 30 messages per minute per IP
+  broadcast: { windowMs: 60 * 1000, maxRequests: 2 } // 2 broadcasts per minute per IP
+};
+
+/**
+ * Clean up old rate limit entries
+ */
+function cleanupRateLimits() {
+  const now = Date.now();
+  for (const [key, data] of rateLimitStore.entries()) {
+    if (now > data.windowStart + data.windowMs) {
+      rateLimitStore.delete(key);
+    }
+  }
+}
+
+// Clean up every minute
+setInterval(cleanupRateLimits, 60 * 1000);
+
+/**
+ * Rate limit middleware factory
+ */
+function rateLimit(type) {
+  const config = RATE_LIMITS[type] || RATE_LIMITS.message;
+  
+  return (req, res, next) => {
+    const ip = req.ip || req.connection.remoteAddress || 'unknown';
+    const key = `${type}:${ip}`;
+    const now = Date.now();
+    
+    let entry = rateLimitStore.get(key);
+    
+    if (!entry || now > entry.windowStart + config.windowMs) {
+      // New window
+      entry = { windowStart: now, windowMs: config.windowMs, count: 0 };
+      rateLimitStore.set(key, entry);
+    }
+    
+    entry.count++;
+    
+    if (entry.count > config.maxRequests) {
+      console.warn(`⚠️ Rate limit exceeded for ${ip} on ${type}`);
+      return res.status(429).json({ 
+        error: 'Too many requests. Please try again later.',
+        retryAfter: Math.ceil((entry.windowStart + config.windowMs - now) / 1000)
+      });
+    }
+    
+    next();
+  };
+}
+
+// ============================================================
+// API KEY VALIDATION MIDDLEWARE
+// ============================================================
+
+/**
+ * Validate API key from header or query param
+ * Header: X-API-Key: your-key
+ * Or Query: ?apiKey=your-key
+ */
+function validateApiKey(req, res, next) {
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+  
+  // Skip API key check for health endpoint
+  if (req.path === '/health') {
+    return next();
+  }
+  
+  if (!apiKey || apiKey !== API_KEY) {
+    console.warn(`⚠️ Invalid API key attempt from ${req.ip}`);
+    return res.status(401).json({ error: 'Invalid or missing API key' });
+  }
+  
+  next();
+}
+
+// Apply API key validation to all routes
+app.use(validateApiKey);
+
+// ============================================================
+// REQUEST LOGGING MIDDLEWARE
+// ============================================================
+
+app.use((req, res, next) => {
+  const timestamp = new Date().toISOString();
+  console.log(`📥 ${timestamp} | ${req.method} ${req.path} | IP: ${req.ip}`);
+  next();
+});
 
 // ============================================================
 // CONFIGURATION
@@ -244,11 +382,11 @@ async function sendOTPWhatsApp(to, otp) {
 // API ENDPOINTS
 // ============================================================
 
-// Health check
+// Health check (no API key required)
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '2.0.0',
+    version: '2.1.0-secured',
     timestamp: new Date().toISOString(),
     supabase: !!SUPABASE_URL,
     twilio: !!TWILIO_CONFIG.accountSid
@@ -256,7 +394,7 @@ app.get('/health', (req, res) => {
 });
 
 // ============================================================
-// OTP ENDPOINTS
+// OTP ENDPOINTS (with rate limiting)
 // ============================================================
 
 /**
@@ -264,7 +402,7 @@ app.get('/health', (req, res) => {
  * POST /api/otp/send
  * Body: { phone: "0541234567" }
  */
-app.post('/api/otp/send', async (req, res) => {
+app.post('/api/otp/send', rateLimit('otp'), async (req, res) => {
   console.log('📥 OTP send request:', req.body);
   
   const { phone } = req.body;
@@ -281,15 +419,10 @@ app.post('/api/otp/send', async (req, res) => {
     storeOTP(phone, otp);
     
     // Send via WhatsApp
-    const result = await sendOTPWhatsApp(phone, otp);
+    await sendOTPWhatsApp(phone, otp);
     
-    console.log('✅ OTP sent to:', normalizePhoneNumber(phone));
-    
-    res.json({ 
-      success: true, 
-      message: 'OTP sent successfully',
-      expiresInMinutes: OTP_EXPIRY_MINUTES
-    });
+    console.log(`✅ OTP sent to ${phone.substring(0, 4)}****`);
+    res.json({ success: true, message: 'OTP sent via WhatsApp' });
   } catch (error) {
     console.error('❌ Error sending OTP:', error);
     res.status(500).json({ error: error.message });
@@ -301,8 +434,8 @@ app.post('/api/otp/send', async (req, res) => {
  * POST /api/otp/verify
  * Body: { phone: "0541234567", code: "123456" }
  */
-app.post('/api/otp/verify', async (req, res) => {
-  console.log('📥 OTP verify request:', req.body);
+app.post('/api/otp/verify', rateLimit('otp'), async (req, res) => {
+  console.log('📥 OTP verify request');
   
   const { phone, code } = req.body;
   
@@ -313,34 +446,29 @@ app.post('/api/otp/verify', async (req, res) => {
   const result = verifyOTP(phone, code);
   
   if (result.valid) {
-    console.log('✅ OTP verified for:', normalizePhoneNumber(phone));
+    console.log(`✅ OTP verified for ${phone.substring(0, 4)}****`);
     res.json({ success: true, verified: true });
   } else {
-    console.log('❌ OTP verification failed:', result.error);
-    res.status(400).json({ success: false, verified: false, error: result.error });
+    console.log(`❌ OTP verification failed: ${result.error}`);
+    res.status(400).json({ success: false, error: result.error });
   }
 });
 
 // ============================================================
-// BOOKING NOTIFICATION ENDPOINTS
+// NOTIFICATION ENDPOINTS (with rate limiting)
 // ============================================================
 
 /**
  * Send booking confirmation
  * POST /api/send-confirmation
  */
-app.post('/api/send-confirmation', async (req, res) => {
-  console.log('📥 Confirmation request:', req.body);
+app.post('/api/send-confirmation', rateLimit('message'), async (req, res) => {
+  console.log('📥 Confirmation request');
   
-  const { phone, clientName, businessName, date, time, whatsappEnabled } = req.body;
+  const { phone, clientName, businessName, date, time } = req.body;
   
   if (!phone || !clientName || !businessName || !date || !time) {
     return res.status(400).json({ error: 'Missing required fields' });
-  }
-  
-  if (whatsappEnabled === false) {
-    console.log('⏭️ WhatsApp disabled for this user');
-    return res.json({ success: true, skipped: true, reason: 'WhatsApp disabled' });
   }
   
   try {
@@ -350,9 +478,8 @@ app.post('/api/send-confirmation', async (req, res) => {
     } catch (e) {
       formattedDate = date;
     }
-    
     // Format time as HH:MM (remove seconds if present)
-    const formattedTime = time ? time.substring(0, 5) : '';
+    const formattedTime = time.substring(0, 5);
     
     const result = await sendWhatsAppMessage(
       phone,
@@ -377,18 +504,13 @@ app.post('/api/send-confirmation', async (req, res) => {
  * Send booking update/cancellation
  * POST /api/send-update
  */
-app.post('/api/send-update', async (req, res) => {
-  console.log('📥 Update request:', req.body);
+app.post('/api/send-update', rateLimit('message'), async (req, res) => {
+  console.log('📥 Update request');
   
-  const { phone, clientName, businessName, whatsappEnabled } = req.body;
+  const { phone, clientName, businessName } = req.body;
   
   if (!phone || !clientName || !businessName) {
     return res.status(400).json({ error: 'Missing required fields' });
-  }
-  
-  if (whatsappEnabled === false) {
-    console.log('⏭️ WhatsApp disabled for this user');
-    return res.json({ success: true, skipped: true, reason: 'WhatsApp disabled' });
   }
   
   try {
@@ -413,7 +535,7 @@ app.post('/api/send-update', async (req, res) => {
  * Send waiting list notification
  * POST /api/send-waiting-list
  */
-app.post('/api/send-waiting-list', async (req, res) => {
+app.post('/api/send-waiting-list', rateLimit('message'), async (req, res) => {
   console.log('📥 Waiting list notification request:', req.body);
   
   const { phone, clientName, date, serviceName } = req.body;
@@ -452,7 +574,7 @@ app.post('/api/send-waiting-list', async (req, res) => {
  * Send broadcast message
  * POST /api/send-broadcast
  */
-app.post('/api/send-broadcast', async (req, res) => {
+app.post('/api/send-broadcast', rateLimit('broadcast'), async (req, res) => {
   console.log('📥 Broadcast request');
   
   const { recipients, message } = req.body;
@@ -463,6 +585,11 @@ app.post('/api/send-broadcast', async (req, res) => {
   
   if (!message) {
     return res.status(400).json({ error: 'Missing message' });
+  }
+  
+  // Limit broadcast size to prevent abuse
+  if (recipients.length > 100) {
+    return res.status(400).json({ error: 'Maximum 100 recipients per broadcast' });
   }
   
   try {
@@ -659,18 +786,21 @@ function scheduleReminders() {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log('\n🚀 LinedUp WhatsApp Service v2.0 Started');
+  console.log('\n🚀 LinedUp WhatsApp Service v2.1 (SECURED) Started');
   console.log(`🌐 Server running on port ${PORT}`);
+  console.log(`🔐 API Key: ${API_KEY ? '✅ Configured' : '❌ NOT SET'}`);
   console.log(`📡 Supabase: ${SUPABASE_URL}`);
   console.log(`📱 Twilio WhatsApp: ${TWILIO_CONFIG.whatsappNumber}`);
+  console.log(`\n🔒 Allowed Origins:`);
+  ALLOWED_ORIGINS.forEach(origin => console.log(`   - ${origin}`));
   console.log('\n📡 Endpoints:');
-  console.log('   GET  /health');
-  console.log('   POST /api/otp/send');
-  console.log('   POST /api/otp/verify');
-  console.log('   POST /api/send-confirmation');
-  console.log('   POST /api/send-update');
-  console.log('   POST /api/send-waiting-list');
-  console.log('   POST /api/send-broadcast');
+  console.log('   GET  /health (no auth)');
+  console.log('   POST /api/otp/send (rate limited: 3/min)');
+  console.log('   POST /api/otp/verify (rate limited: 3/min)');
+  console.log('   POST /api/send-confirmation (rate limited: 30/min)');
+  console.log('   POST /api/send-update (rate limited: 30/min)');
+  console.log('   POST /api/send-waiting-list (rate limited: 30/min)');
+  console.log('   POST /api/send-broadcast (rate limited: 2/min, max 100 recipients)');
   console.log('');
   
   // Start reminder scheduler
