@@ -780,6 +780,209 @@ function scheduleReminders() {
 }
 
 // ============================================================
+// RECURRING APPOINTMENTS AUTO-EXTEND
+// ============================================================
+
+/**
+ * Get all active recurring appointment rules
+ */
+async function fetchActiveRecurringRules() {
+  const { data, error } = await supabase
+    .from('recurring_appointments')
+    .select('*, businesses(*)')
+    .eq('is_active', true);
+  
+  if (error) {
+    console.error('Error fetching recurring rules:', error);
+    return [];
+  }
+  
+  return data || [];
+}
+
+/**
+ * Get next occurrence date for a recurring rule
+ */
+function getNextOccurrence(rule, afterDate) {
+  const targetDay = rule.day_of_week; // 0=Sunday, 1=Monday, etc.
+  let nextDate = new Date(afterDate);
+  nextDate.setDate(nextDate.getDate() + 1); // Start from day after
+  
+  // Find next occurrence of the target day
+  while (nextDate.getDay() !== targetDay) {
+    nextDate.setDate(nextDate.getDate() + 1);
+  }
+  
+  // For biweekly, check if this is the correct week
+  if (rule.frequency === 'biweekly' && rule.biweekly_start_date) {
+    const startDate = new Date(rule.biweekly_start_date);
+    const weeksDiff = Math.floor((nextDate - startDate) / (7 * 24 * 60 * 60 * 1000));
+    
+    // If odd number of weeks, skip to next occurrence
+    if (weeksDiff % 2 !== 0) {
+      nextDate.setDate(nextDate.getDate() + 7);
+    }
+  }
+  
+  return nextDate;
+}
+
+/**
+ * Check if a booking already exists for a date/time
+ */
+async function bookingExists(businessId, date, time, clientPhone) {
+  const { data, error } = await supabase
+    .from('bookings')
+    .select('id')
+    .eq('business_id', businessId)
+    .eq('date', date)
+    .eq('time', time)
+    .eq('client_phone', clientPhone)
+    .neq('status', 'cancelled')
+    .limit(1);
+  
+  if (error) {
+    console.error('Error checking booking exists:', error);
+    return true; // Assume exists to prevent duplicates
+  }
+  
+  return data && data.length > 0;
+}
+
+/**
+ * Create a booking for a recurring rule
+ */
+async function createRecurringBooking(rule, date) {
+  const dateStr = date.toISOString().split('T')[0];
+  
+  // Check if booking already exists
+  const exists = await bookingExists(rule.business_id, dateStr, rule.time, rule.client_phone);
+  if (exists) {
+    console.log(`   ⏭️ Booking already exists for ${dateStr}`);
+    return null;
+  }
+  
+  const { data, error } = await supabase
+    .from('bookings')
+    .insert({
+      business_id: rule.business_id,
+      client_name: rule.client_name,
+      client_email: rule.client_email,
+      client_phone: rule.client_phone,
+      service_id: rule.service_id,
+      service_name: rule.service_name,
+      staff_id: rule.staff_id,
+      staff_name: rule.staff_name,
+      date: dateStr,
+      time: rule.time,
+      duration: rule.duration || 30,
+      status: 'confirmed',
+      notes: rule.notes,
+      recurring_appointment_id: rule.id
+    })
+    .select()
+    .single();
+  
+  if (error) {
+    console.error(`   ❌ Error creating booking for ${dateStr}:`, error);
+    return null;
+  }
+  
+  console.log(`   ✅ Created booking for ${dateStr} at ${rule.time}`);
+  return data;
+}
+
+/**
+ * Process recurring appointments - extend into newly available dates
+ */
+async function processRecurringAppointments() {
+  console.log('\n' + '='.repeat(60));
+  console.log(`🔄 Recurring Appointments Check: ${new Date().toISOString()}`);
+  console.log('='.repeat(60));
+  
+  try {
+    const rules = await fetchActiveRecurringRules();
+    console.log(`Found ${rules.length} active recurring rule(s)`);
+    
+    let totalCreated = 0;
+    
+    for (const rule of rules) {
+      const business = rule.businesses;
+      if (!business) continue;
+      
+      console.log(`\n📋 Processing: ${rule.client_name} - ${rule.service_name}`);
+      console.log(`   Day: ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][rule.day_of_week]}, Time: ${rule.time}, Freq: ${rule.frequency}`);
+      
+      // Calculate booking window
+      const bookingWindowDays = business.booking_window_enabled 
+        ? (business.booking_window_days || 30) 
+        : 90; // Default 90 days if no window set
+      
+      const today = new Date();
+      const maxDate = new Date(today);
+      maxDate.setDate(maxDate.getDate() + bookingWindowDays);
+      
+      // Get last booking date
+      const lastBookingDate = rule.last_booking_date 
+        ? new Date(rule.last_booking_date) 
+        : today;
+      
+      console.log(`   Window: ${bookingWindowDays} days, Max date: ${maxDate.toISOString().split('T')[0]}`);
+      console.log(`   Last booking: ${lastBookingDate.toISOString().split('T')[0]}`);
+      
+      // Find and create missing bookings
+      let currentDate = getNextOccurrence(rule, lastBookingDate);
+      let newLastDate = lastBookingDate;
+      
+      while (currentDate <= maxDate) {
+        const booking = await createRecurringBooking(rule, currentDate);
+        if (booking) {
+          totalCreated++;
+          newLastDate = currentDate;
+        }
+        
+        // Move to next occurrence
+        if (rule.frequency === 'weekly') {
+          currentDate.setDate(currentDate.getDate() + 7);
+        } else if (rule.frequency === 'biweekly') {
+          currentDate.setDate(currentDate.getDate() + 14);
+        }
+      }
+      
+      // Update last_booking_date if we created new bookings
+      if (newLastDate > lastBookingDate) {
+        await supabase
+          .from('recurring_appointments')
+          .update({ 
+            last_booking_date: newLastDate.toISOString().split('T')[0],
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', rule.id);
+      }
+    }
+    
+    console.log(`\n📊 Total new bookings created: ${totalCreated}`);
+    console.log('='.repeat(60) + '\n');
+  } catch (error) {
+    console.error('❌ Error in recurring check:', error);
+  }
+}
+
+/**
+ * Schedule recurring appointments check - run once per hour
+ */
+function scheduleRecurringCheck() {
+  // Run after 5 minutes from start (give server time to warm up)
+  setTimeout(() => {
+    processRecurringAppointments();
+    // Then run every hour
+    setInterval(processRecurringAppointments, 60 * 60 * 1000);
+  }, 5 * 60 * 1000);
+  
+  console.log('🔄 Recurring appointments check scheduled (hourly)');
+}
+
+// ============================================================
 // START SERVER
 // ============================================================
 
@@ -805,6 +1008,9 @@ app.listen(PORT, () => {
   
   // Start reminder scheduler
   scheduleReminders();
+  
+  // Start recurring appointments scheduler
+  scheduleRecurringCheck();
 });
 
 // Graceful shutdown
