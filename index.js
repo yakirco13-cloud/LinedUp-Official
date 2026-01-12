@@ -182,22 +182,34 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-// Twilio Configuration
+// Twilio Configuration - ALL templates from environment variables
 const TWILIO_CONFIG = {
   accountSid: process.env.TWILIO_ACCOUNT_SID,
   authToken: process.env.TWILIO_AUTH_TOKEN,
   whatsappNumber: process.env.TWILIO_WHATSAPP_NUMBER,
-  templateSid: process.env.TWILIO_TEMPLATE_SID, // For reminders
-  otpTemplateSid: process.env.TWILIO_OTP_TEMPLATE_SID || 'HX4f5f36cf2e136b35474c99890e2fc612',
-  confirmationTemplateSid: process.env.TWILIO_CONFIRMATION_TEMPLATE_SID || 'HX833cc8141398f0a037c21e061404bba0',
-  updateTemplateSid: process.env.TWILIO_UPDATE_TEMPLATE_SID || 'HXfb6f60eb9acb068d3100d204e8d866b9',
-  waitingListTemplateSid: process.env.TWILIO_WAITING_LIST_TEMPLATE_SID || 'HXd75dea9bfaea32988c7532ecc6969b34',
-  broadcastTemplateSid: process.env.TWILIO_BROADCAST_TEMPLATE_SID || 'HXd94763214416ec4100848e81162aad92',
+  // Template SIDs - all from environment variables
+  otpTemplateSid: process.env.TWILIO_OTP_TEMPLATE_SID,
+  confirmationTemplateSid: process.env.TWILIO_CONFIRMATION_TEMPLATE_SID,
+  updateTemplateSid: process.env.TWILIO_UPDATE_TEMPLATE_SID,
+  cancelTemplateSid: process.env.TWILIO_CANCEL_TEMPLATE_SID,
+  waitingListTemplateSid: process.env.TWILIO_WAITING_LIST_TEMPLATE_SID,
+  reminderTemplateSid: process.env.TWILIO_REMINDER_TEMPLATE_SID,
+  broadcastTemplateSid: process.env.TWILIO_BROADCAST_TEMPLATE_SID,
 };
 
+// Validate required Twilio credentials
 if (!TWILIO_CONFIG.accountSid || !TWILIO_CONFIG.authToken || !TWILIO_CONFIG.whatsappNumber) {
   console.error('❌ ERROR: Missing Twilio credentials!');
   console.error('Please set: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER');
+  process.exit(1);
+}
+
+// Validate required template SIDs
+const requiredTemplates = ['otpTemplateSid', 'confirmationTemplateSid', 'updateTemplateSid', 'cancelTemplateSid', 'waitingListTemplateSid'];
+const missingTemplates = requiredTemplates.filter(t => !TWILIO_CONFIG[t]);
+if (missingTemplates.length > 0) {
+  console.error('❌ ERROR: Missing Twilio template SIDs!');
+  console.error('Please set:', missingTemplates.map(t => `TWILIO_${t.replace('TemplateSid', '').toUpperCase()}_TEMPLATE_SID`).join(', '));
   process.exit(1);
 }
 
@@ -532,6 +544,46 @@ app.post('/api/send-update', rateLimit('message'), async (req, res) => {
 });
 
 /**
+ * Send booking cancellation
+ * POST /api/send-cancellation
+ * Template: היי {{1}}, התור שלך עבור {{2}} בתאריך {{3}} בוטל.
+ */
+app.post('/api/send-cancellation', rateLimit('message'), async (req, res) => {
+  console.log('📥 Cancellation request');
+  
+  const { phone, clientName, serviceName, date } = req.body;
+  
+  if (!phone || !clientName || !serviceName || !date) {
+    return res.status(400).json({ error: 'Missing required fields: phone, clientName, serviceName, date' });
+  }
+  
+  try {
+    let formattedDate;
+    try {
+      formattedDate = format(parseISO(date), 'd.M.yyyy');
+    } catch (e) {
+      formattedDate = date;
+    }
+    
+    const result = await sendWhatsAppMessage(
+      phone,
+      TWILIO_CONFIG.cancelTemplateSid,
+      {
+        "1": String(clientName),
+        "2": String(serviceName),
+        "3": String(formattedDate)
+      }
+    );
+    
+    console.log('✅ Cancellation sent');
+    res.json({ success: true, messageSid: result.sid });
+  } catch (error) {
+    console.error('❌ Error sending cancellation:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * Send waiting list notification
  * POST /api/send-waiting-list
  */
@@ -712,7 +764,7 @@ async function processBusinessReminders(business) {
       
       await sendWhatsAppMessage(
         booking.client_phone,
-        TWILIO_CONFIG.templateSid,
+        TWILIO_CONFIG.reminderTemplateSid,
         {
           "1": booking.client_name || 'לקוח יקר',
           "2": business.name,
@@ -780,220 +832,25 @@ function scheduleReminders() {
 }
 
 // ============================================================
-// RECURRING APPOINTMENTS AUTO-EXTEND
-// ============================================================
-
-/**
- * Get all active recurring appointment rules
- */
-async function fetchActiveRecurringRules() {
-  const { data, error } = await supabase
-    .from('recurring_appointments')
-    .select('*, businesses(*)')
-    .eq('is_active', true);
-  
-  if (error) {
-    console.error('Error fetching recurring rules:', error);
-    return [];
-  }
-  
-  return data || [];
-}
-
-/**
- * Get next occurrence date for a recurring rule
- */
-function getNextOccurrence(rule, afterDate) {
-  const targetDay = rule.day_of_week; // 0=Sunday, 1=Monday, etc.
-  let nextDate = new Date(afterDate);
-  nextDate.setDate(nextDate.getDate() + 1); // Start from day after
-  
-  // Find next occurrence of the target day
-  while (nextDate.getDay() !== targetDay) {
-    nextDate.setDate(nextDate.getDate() + 1);
-  }
-  
-  // For biweekly, check if this is the correct week
-  if (rule.frequency === 'biweekly' && rule.biweekly_start_date) {
-    const startDate = new Date(rule.biweekly_start_date);
-    const weeksDiff = Math.floor((nextDate - startDate) / (7 * 24 * 60 * 60 * 1000));
-    
-    // If odd number of weeks, skip to next occurrence
-    if (weeksDiff % 2 !== 0) {
-      nextDate.setDate(nextDate.getDate() + 7);
-    }
-  }
-  
-  return nextDate;
-}
-
-/**
- * Check if a booking already exists for a date/time
- */
-async function bookingExists(businessId, date, time, clientPhone) {
-  const { data, error } = await supabase
-    .from('bookings')
-    .select('id')
-    .eq('business_id', businessId)
-    .eq('date', date)
-    .eq('time', time)
-    .eq('client_phone', clientPhone)
-    .neq('status', 'cancelled')
-    .limit(1);
-  
-  if (error) {
-    console.error('Error checking booking exists:', error);
-    return true; // Assume exists to prevent duplicates
-  }
-  
-  return data && data.length > 0;
-}
-
-/**
- * Create a booking for a recurring rule
- */
-async function createRecurringBooking(rule, date) {
-  const dateStr = date.toISOString().split('T')[0];
-  
-  // Check if booking already exists
-  const exists = await bookingExists(rule.business_id, dateStr, rule.time, rule.client_phone);
-  if (exists) {
-    console.log(`   ⏭️ Booking already exists for ${dateStr}`);
-    return null;
-  }
-  
-  const { data, error } = await supabase
-    .from('bookings')
-    .insert({
-      business_id: rule.business_id,
-      client_name: rule.client_name,
-      client_email: rule.client_email,
-      client_phone: rule.client_phone,
-      service_id: rule.service_id,
-      service_name: rule.service_name,
-      staff_id: rule.staff_id,
-      staff_name: rule.staff_name,
-      date: dateStr,
-      time: rule.time,
-      duration: rule.duration || 30,
-      status: 'confirmed',
-      notes: rule.notes,
-      recurring_appointment_id: rule.id
-    })
-    .select()
-    .single();
-  
-  if (error) {
-    console.error(`   ❌ Error creating booking for ${dateStr}:`, error);
-    return null;
-  }
-  
-  console.log(`   ✅ Created booking for ${dateStr} at ${rule.time}`);
-  return data;
-}
-
-/**
- * Process recurring appointments - extend into newly available dates
- */
-async function processRecurringAppointments() {
-  console.log('\n' + '='.repeat(60));
-  console.log(`🔄 Recurring Appointments Check: ${new Date().toISOString()}`);
-  console.log('='.repeat(60));
-  
-  try {
-    const rules = await fetchActiveRecurringRules();
-    console.log(`Found ${rules.length} active recurring rule(s)`);
-    
-    let totalCreated = 0;
-    
-    for (const rule of rules) {
-      const business = rule.businesses;
-      if (!business) continue;
-      
-      console.log(`\n📋 Processing: ${rule.client_name} - ${rule.service_name}`);
-      console.log(`   Day: ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][rule.day_of_week]}, Time: ${rule.time}, Freq: ${rule.frequency}`);
-      
-      // Calculate booking window
-      const bookingWindowDays = business.booking_window_enabled 
-        ? (business.booking_window_days || 30) 
-        : 90; // Default 90 days if no window set
-      
-      const today = new Date();
-      const maxDate = new Date(today);
-      maxDate.setDate(maxDate.getDate() + bookingWindowDays);
-      
-      // Get last booking date
-      const lastBookingDate = rule.last_booking_date 
-        ? new Date(rule.last_booking_date) 
-        : today;
-      
-      console.log(`   Window: ${bookingWindowDays} days, Max date: ${maxDate.toISOString().split('T')[0]}`);
-      console.log(`   Last booking: ${lastBookingDate.toISOString().split('T')[0]}`);
-      
-      // Find and create missing bookings
-      let currentDate = getNextOccurrence(rule, lastBookingDate);
-      let newLastDate = lastBookingDate;
-      
-      while (currentDate <= maxDate) {
-        const booking = await createRecurringBooking(rule, currentDate);
-        if (booking) {
-          totalCreated++;
-          newLastDate = currentDate;
-        }
-        
-        // Move to next occurrence
-        if (rule.frequency === 'weekly') {
-          currentDate.setDate(currentDate.getDate() + 7);
-        } else if (rule.frequency === 'biweekly') {
-          currentDate.setDate(currentDate.getDate() + 14);
-        }
-      }
-      
-      // Update last_booking_date if we created new bookings
-      if (newLastDate > lastBookingDate) {
-        await supabase
-          .from('recurring_appointments')
-          .update({ 
-            last_booking_date: newLastDate.toISOString().split('T')[0],
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', rule.id);
-      }
-    }
-    
-    console.log(`\n📊 Total new bookings created: ${totalCreated}`);
-    console.log('='.repeat(60) + '\n');
-  } catch (error) {
-    console.error('❌ Error in recurring check:', error);
-  }
-}
-
-/**
- * Schedule recurring appointments check - run once per hour
- */
-function scheduleRecurringCheck() {
-  // Run after 5 minutes from start (give server time to warm up)
-  setTimeout(() => {
-    processRecurringAppointments();
-    // Then run every hour
-    setInterval(processRecurringAppointments, 60 * 60 * 1000);
-  }, 5 * 60 * 1000);
-  
-  console.log('🔄 Recurring appointments check scheduled (hourly)');
-}
-
-// ============================================================
 // START SERVER
 // ============================================================
 
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log('\n🚀 LinedUp WhatsApp Service v2.1 (SECURED) Started');
+  console.log('\n🚀 LinedUp WhatsApp Service v2.2 (SECURED) Started');
   console.log(`🌐 Server running on port ${PORT}`);
   console.log(`🔐 API Key: ${API_KEY ? '✅ Configured' : '❌ NOT SET'}`);
   console.log(`📡 Supabase: ${SUPABASE_URL}`);
   console.log(`📱 Twilio WhatsApp: ${TWILIO_CONFIG.whatsappNumber}`);
+  console.log(`\n📋 Templates loaded:`);
+  console.log(`   - OTP: ${TWILIO_CONFIG.otpTemplateSid ? '✅' : '❌'}`);
+  console.log(`   - Confirmation: ${TWILIO_CONFIG.confirmationTemplateSid ? '✅' : '❌'}`);
+  console.log(`   - Update: ${TWILIO_CONFIG.updateTemplateSid ? '✅' : '❌'}`);
+  console.log(`   - Cancel: ${TWILIO_CONFIG.cancelTemplateSid ? '✅' : '❌'}`);
+  console.log(`   - Waiting List: ${TWILIO_CONFIG.waitingListTemplateSid ? '✅' : '❌'}`);
+  console.log(`   - Reminder: ${TWILIO_CONFIG.reminderTemplateSid ? '✅' : '❌'}`);
+  console.log(`   - Broadcast: ${TWILIO_CONFIG.broadcastTemplateSid ? '✅' : '❌'}`);
   console.log(`\n🔒 Allowed Origins:`);
   ALLOWED_ORIGINS.forEach(origin => console.log(`   - ${origin}`));
   console.log('\n📡 Endpoints:');
@@ -1002,15 +859,13 @@ app.listen(PORT, () => {
   console.log('   POST /api/otp/verify (rate limited: 3/min)');
   console.log('   POST /api/send-confirmation (rate limited: 30/min)');
   console.log('   POST /api/send-update (rate limited: 30/min)');
+  console.log('   POST /api/send-cancellation (rate limited: 30/min)');
   console.log('   POST /api/send-waiting-list (rate limited: 30/min)');
   console.log('   POST /api/send-broadcast (rate limited: 2/min, max 100 recipients)');
   console.log('');
   
   // Start reminder scheduler
   scheduleReminders();
-  
-  // Start recurring appointments scheduler
-  scheduleRecurringCheck();
 });
 
 // Graceful shutdown
