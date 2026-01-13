@@ -1,5 +1,5 @@
 /**
- * LinedUp WhatsApp Service v2.0
+ * LinedUp WhatsApp Service v2.1
  * 
  * Features:
  * - OTP Authentication (send & verify)
@@ -8,6 +8,7 @@
  * - Automated reminders
  * - Waiting list notifications
  * - Broadcast messages
+ * - ICS Calendar Feed (NEW!)
  * 
  * Connects to: Supabase (not Base44)
  * Provider: Twilio WhatsApp API
@@ -248,7 +249,7 @@ async function sendOTPWhatsApp(to, otp) {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '2.0.0',
+    version: '2.1.0',
     timestamp: new Date().toISOString(),
     supabase: !!SUPABASE_URL,
     twilio: !!TWILIO_CONFIG.accountSid
@@ -281,15 +282,10 @@ app.post('/api/otp/send', async (req, res) => {
     storeOTP(phone, otp);
     
     // Send via WhatsApp
-    const result = await sendOTPWhatsApp(phone, otp);
+    await sendOTPWhatsApp(phone, otp);
     
-    console.log('✅ OTP sent to:', normalizePhoneNumber(phone));
-    
-    res.json({ 
-      success: true, 
-      message: 'OTP sent successfully',
-      expiresInMinutes: OTP_EXPIRY_MINUTES
-    });
+    console.log('✅ OTP sent successfully');
+    res.json({ success: true, message: 'OTP sent' });
   } catch (error) {
     console.error('❌ Error sending OTP:', error);
     res.status(500).json({ error: error.message });
@@ -313,55 +309,11 @@ app.post('/api/otp/verify', async (req, res) => {
   const result = verifyOTP(phone, code);
   
   if (result.valid) {
-    console.log('✅ OTP verified for:', normalizePhoneNumber(phone));
+    console.log('✅ OTP verified successfully');
     res.json({ success: true, verified: true });
   } else {
     console.log('❌ OTP verification failed:', result.error);
-    res.status(400).json({ success: false, verified: false, error: result.error });
-  }
-});
-
-/**
- * Reset password (requires OTP verification first)
- * POST /api/reset-password
- * Body: { email: "972xxx@phone.linedup.app", newPassword: "newpass123", userId: "uuid" }
- */
-app.post('/api/reset-password', async (req, res) => {
-  console.log('📥 Password reset request for:', req.body.email);
-  
-  // Verify API key
-  const apiKey = req.headers['x-api-key'];
-  if (!apiKey || apiKey !== process.env.API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  const { email, newPassword, userId } = req.body;
-  
-  if (!email || !newPassword || !userId) {
-    return res.status(400).json({ error: 'Missing required fields: email, newPassword, userId' });
-  }
-  
-  if (newPassword.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  }
-  
-  try {
-    // Use Supabase Admin API to update user password
-    const { data, error } = await supabase.auth.admin.updateUserById(
-      userId,
-      { password: newPassword }
-    );
-    
-    if (error) {
-      console.error('❌ Supabase admin password update error:', error);
-      return res.status(500).json({ error: 'Failed to update password', details: error.message });
-    }
-    
-    console.log('✅ Password updated for user:', userId);
-    res.json({ success: true, message: 'Password updated successfully' });
-  } catch (error) {
-    console.error('❌ Error resetting password:', error);
-    res.status(500).json({ error: error.message });
+    res.status(400).json({ success: false, error: result.error });
   }
 });
 
@@ -376,18 +328,14 @@ app.post('/api/reset-password', async (req, res) => {
 app.post('/api/send-confirmation', async (req, res) => {
   console.log('📥 Confirmation request:', req.body);
   
-  const { phone, clientName, businessName, date, time, whatsappEnabled } = req.body;
+  const { phone, clientName, businessName, date, time, serviceName } = req.body;
   
   if (!phone || !clientName || !businessName || !date || !time) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
   
-  if (whatsappEnabled === false) {
-    console.log('⏭️ WhatsApp disabled for this user');
-    return res.json({ success: true, skipped: true, reason: 'WhatsApp disabled' });
-  }
-  
   try {
+    // Format the date nicely
     let formattedDate;
     try {
       formattedDate = format(parseISO(date), 'd.M.yyyy');
@@ -395,8 +343,8 @@ app.post('/api/send-confirmation', async (req, res) => {
       formattedDate = date;
     }
     
-    // Format time as HH:MM (remove seconds if present)
-    const formattedTime = time ? time.substring(0, 5) : '';
+    // Format time as HH:MM
+    const formattedTime = time.substring(0, 5);
     
     const result = await sendWhatsAppMessage(
       phone,
@@ -405,7 +353,8 @@ app.post('/api/send-confirmation', async (req, res) => {
         "1": String(clientName),
         "2": String(businessName),
         "3": String(formattedDate),
-        "4": String(formattedTime)
+        "4": String(formattedTime),
+        "5": String(serviceName || 'תור')
       }
     );
     
@@ -424,24 +373,40 @@ app.post('/api/send-confirmation', async (req, res) => {
 app.post('/api/send-update', async (req, res) => {
   console.log('📥 Update request:', req.body);
   
-  const { phone, clientName, businessName, whatsappEnabled } = req.body;
+  const { phone, clientName, businessName, date, time, status, serviceName } = req.body;
   
   if (!phone || !clientName || !businessName) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
   
-  if (whatsappEnabled === false) {
-    console.log('⏭️ WhatsApp disabled for this user');
-    return res.json({ success: true, skipped: true, reason: 'WhatsApp disabled' });
-  }
-  
   try {
+    let formattedDate = '';
+    let formattedTime = '';
+    
+    if (date) {
+      try {
+        formattedDate = format(parseISO(date), 'd.M.yyyy');
+      } catch (e) {
+        formattedDate = date;
+      }
+    }
+    
+    if (time) {
+      formattedTime = time.substring(0, 5);
+    }
+    
+    // Status text
+    const statusText = status === 'cancelled' ? 'בוטל' : 'עודכן';
+    
     const result = await sendWhatsAppMessage(
       phone,
       TWILIO_CONFIG.updateTemplateSid,
       {
         "1": String(clientName),
-        "2": String(businessName)
+        "2": String(businessName),
+        "3": String(statusText),
+        "4": String(formattedDate || ''),
+        "5": String(formattedTime || '')
       }
     );
     
@@ -536,6 +501,193 @@ app.post('/api/send-broadcast', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ============================================================
+// ICS CALENDAR FEED
+// ============================================================
+
+/**
+ * Generate ICS calendar feed for a business
+ * GET /cal/:businessId.ics
+ * 
+ * Usage: Add to Google Calendar via "Add calendar from URL"
+ */
+app.get('/cal/:businessId.ics', async (req, res) => {
+  try {
+    const businessId = req.params.businessId.replace('.ics', '');
+    
+    console.log(`📅 Calendar feed requested for business: ${businessId}`);
+    
+    // Get business info
+    const { data: business, error: businessError } = await supabase
+      .from('businesses')
+      .select('name, phone')
+      .eq('id', businessId)
+      .single();
+    
+    if (businessError || !business) {
+      console.error('❌ Business not found:', businessId);
+      return res.status(404).send('Calendar not found');
+    }
+    
+    // Get all future bookings for this business
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const { data: bookings, error: bookingsError } = await supabase
+      .from('bookings')
+      .select(`
+        id,
+        date,
+        time,
+        duration,
+        status,
+        client_name,
+        client_phone,
+        notes,
+        service_id,
+        services (name)
+      `)
+      .eq('business_id', businessId)
+      .gte('date', today.toISOString().split('T')[0])
+      .in('status', ['approved', 'pending', 'confirmed'])
+      .order('date', { ascending: true })
+      .order('time', { ascending: true });
+    
+    if (bookingsError) {
+      console.error('❌ Error fetching bookings:', bookingsError);
+      return res.status(500).send('Error generating calendar');
+    }
+    
+    // Generate ICS content
+    const icsContent = generateICS(business, bookings || []);
+    
+    // Set headers for ICS file
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="linedup-${businessId}.ics"`);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    
+    console.log(`✅ Calendar feed generated with ${bookings?.length || 0} events`);
+    
+    res.send(icsContent);
+    
+  } catch (error) {
+    console.error('❌ Calendar feed error:', error);
+    res.status(500).send('Error generating calendar');
+  }
+});
+
+/**
+ * Generate ICS file content
+ */
+function generateICS(business, bookings) {
+  let ics = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//LinedUp//Calendar//HE',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    `X-WR-CALNAME:LinedUp - ${business.name}`,
+    'X-WR-TIMEZONE:Asia/Jerusalem',
+    // Timezone definition for Israel
+    'BEGIN:VTIMEZONE',
+    'TZID:Asia/Jerusalem',
+    'BEGIN:STANDARD',
+    'DTSTART:19701025T020000',
+    'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU',
+    'TZOFFSETFROM:+0300',
+    'TZOFFSETTO:+0200',
+    'TZNAME:IST',
+    'END:STANDARD',
+    'BEGIN:DAYLIGHT',
+    'DTSTART:19700329T020000',
+    'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1FR',
+    'TZOFFSETFROM:+0200',
+    'TZOFFSETTO:+0300',
+    'TZNAME:IDT',
+    'END:DAYLIGHT',
+    'END:VTIMEZONE',
+  ];
+  
+  // Add each booking as an event
+  for (const booking of bookings) {
+    const event = generateEvent(booking, business);
+    ics = ics.concat(event);
+  }
+  
+  ics.push('END:VCALENDAR');
+  
+  return ics.join('\r\n');
+}
+
+/**
+ * Generate a single VEVENT for a booking
+ */
+function generateEvent(booking, business) {
+  const serviceName = booking.services?.name || 'תור';
+  const clientName = booking.client_name || 'לקוח';
+  const clientPhone = booking.client_phone || '';
+  
+  // Parse date and time
+  const [year, month, day] = booking.date.split('-');
+  const [hours, minutes] = booking.time.split(':');
+  
+  // Create start date
+  const startDate = new Date(year, month - 1, day, hours, minutes);
+  
+  // Calculate end date based on duration (default 30 minutes)
+  const duration = booking.duration || 30;
+  const endDate = new Date(startDate.getTime() + duration * 60000);
+  
+  // Format dates for ICS
+  const dtStart = formatICSDate(startDate);
+  const dtEnd = formatICSDate(endDate);
+  const dtStamp = formatICSDate(new Date());
+  
+  // Create unique ID
+  const uid = `booking-${booking.id}@linedup.app`;
+  
+  // Build description
+  let description = `לקוח: ${clientName}`;
+  if (clientPhone) {
+    description += `\\nטלפון: ${clientPhone}`;
+  }
+  if (booking.notes) {
+    description += `\\nהערות: ${booking.notes}`;
+  }
+  const statusHe = booking.status === 'approved' || booking.status === 'confirmed' ? 'מאושר' : 'ממתין לאישור';
+  description += `\\nסטטוס: ${statusHe}`;
+  
+  // Status emoji
+  const statusEmoji = booking.status === 'approved' || booking.status === 'confirmed' ? '✅' : '⏳';
+  
+  return [
+    'BEGIN:VEVENT',
+    `UID:${uid}`,
+    `DTSTAMP:${dtStamp}`,
+    `DTSTART;TZID=Asia/Jerusalem:${dtStart}`,
+    `DTEND;TZID=Asia/Jerusalem:${dtEnd}`,
+    `SUMMARY:${statusEmoji} ${serviceName} - ${clientName}`,
+    `DESCRIPTION:${description}`,
+    `LOCATION:${business.name}`,
+    `STATUS:${booking.status === 'approved' || booking.status === 'confirmed' ? 'CONFIRMED' : 'TENTATIVE'}`,
+    'END:VEVENT',
+  ];
+}
+
+/**
+ * Format date for ICS (YYYYMMDDTHHmmss)
+ */
+function formatICSDate(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  
+  return `${year}${month}${day}T${hours}${minutes}${seconds}`;
+}
 
 // ============================================================
 // AUTOMATED REMINDERS (from Supabase)
@@ -703,7 +855,7 @@ function scheduleReminders() {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log('\n🚀 LinedUp WhatsApp Service v2.0 Started');
+  console.log('\n🚀 LinedUp WhatsApp Service v2.1 Started');
   console.log(`🌐 Server running on port ${PORT}`);
   console.log(`📡 Supabase: ${SUPABASE_URL}`);
   console.log(`📱 Twilio WhatsApp: ${TWILIO_CONFIG.whatsappNumber}`);
@@ -715,6 +867,7 @@ app.listen(PORT, () => {
   console.log('   POST /api/send-update');
   console.log('   POST /api/send-waiting-list');
   console.log('   POST /api/send-broadcast');
+  console.log('   GET  /cal/:businessId.ics');
   console.log('');
   
   // Start reminder scheduler
