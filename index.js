@@ -504,83 +504,132 @@ app.post('/api/send-broadcast', async (req, res) => {
 });
 
 // ============================================================
-// GROW PAYMENT WEBHOOK (via Make.com)
+// GROW PAYMENT WEBHOOK (Direct from Grow)
 // ============================================================
 
 /**
  * Webhook endpoint for Grow payments
  * POST /api/webhooks/grow
  * 
- * Expected payload from Make.com:
+ * Actual payload from Grow:
  * {
- *   "email": "customer@email.com",
- *   "phone": "0541234567",
- *   "full_name": "שם הלקוח",
- *   "business_name": "שם העסק",
- *   "amount": 490,
- *   "plan": "pro",           // starter, pro, or premium
- *   "billing_cycle": "yearly", // monthly or yearly
- *   "payment_id": "grow_xxx",
- *   "status": "completed"
+ *   "webhookKey": "xxx",
+ *   "transactionCode": "xxx",
+ *   "transactionType": "Bit",
+ *   "paymentSum": "490",
+ *   "paymentDesc": "pro-yearly",  // Plan name set in payment link
+ *   "fullName": "יקיר כהן",
+ *   "payerPhone": "0522096448",
+ *   "payerEmail": "email@example.com",
+ *   "asmachta": "123456",
+ *   "paymentSource": "Payment Links",
+ *   ...
  * }
  */
 app.post('/api/webhooks/grow', async (req, res) => {
   console.log('💳 Grow webhook received:', JSON.stringify(req.body, null, 2));
   
+  // Extract Grow's actual field names
   const { 
-    email, 
-    phone,
-    full_name,
-    business_name,
-    amount, 
-    plan, 
-    billing_cycle, 
-    payment_id,
-    status 
+    payerEmail,
+    payerPhone,
+    fullName,
+    paymentSum,
+    paymentDesc,  // This should contain plan info like "pro-yearly" or "starter-monthly"
+    asmachta,
+    transactionCode
   } = req.body;
 
-  // Validate required fields
-  if (!email || !plan) {
-    console.error('❌ Missing required fields');
-    return res.status(400).json({ error: 'Missing required fields: email, plan' });
+  // Parse plan from paymentDesc (expected format: "pro-yearly", "starter-monthly", etc.)
+  let plan = 'pro';  // Default
+  let billingCycle = 'yearly';  // Default
+  
+  if (paymentDesc) {
+    const desc = paymentDesc.toLowerCase();
+    
+    // Extract plan
+    if (desc.includes('premium')) plan = 'premium';
+    else if (desc.includes('pro')) plan = 'pro';
+    else if (desc.includes('starter')) plan = 'starter';
+    else if (desc.includes('free')) plan = 'free';
+    
+    // Extract billing cycle
+    if (desc.includes('month') || desc.includes('חודש')) billingCycle = 'monthly';
+    else if (desc.includes('year') || desc.includes('annual') || desc.includes('שנת')) billingCycle = 'yearly';
+  }
+  
+  // Also try to determine from amount if description doesn't help
+  const amount = parseFloat(paymentSum) || 0;
+  if (!paymentDesc || paymentDesc === 'TEST') {
+    // Guess plan from amount
+    if (amount >= 1290 || amount >= 129) plan = 'premium';
+    else if (amount >= 790 || amount >= 79) plan = 'pro';
+    else if (amount >= 490 || amount >= 49) plan = 'starter';
   }
 
-  // Only process completed payments
-  if (status && status !== 'completed') {
-    console.log('⏭️ Skipping non-completed payment:', status);
-    return res.json({ success: true, message: 'Skipped non-completed payment' });
+  // Validate required fields
+  if (!payerEmail) {
+    console.error('❌ Missing payerEmail');
+    return res.status(400).json({ error: 'Missing required field: payerEmail' });
   }
+
+  console.log(`📋 Parsed: plan=${plan}, cycle=${billingCycle}, amount=${amount}`);
 
   try {
     // Find business by email
     const { data: business, error: businessError } = await supabase
       .from('businesses')
       .select('id, name, email')
-      .eq('email', email.toLowerCase().trim())
+      .eq('email', payerEmail.toLowerCase().trim())
       .single();
 
     if (businessError || !business) {
-      console.error('❌ Business not found for email:', email);
+      console.error('❌ Business not found for email:', payerEmail);
       
       // Try to find by phone as fallback
-      if (phone) {
-        const { data: businessByPhone, error: phoneError } = await supabase
+      if (payerPhone) {
+        // Try with original format
+        let { data: businessByPhone, error: phoneError } = await supabase
           .from('businesses')
           .select('id, name, email')
-          .eq('phone', phone)
+          .eq('phone', payerPhone)
           .single();
         
-        if (!phoneError && businessByPhone) {
+        // Try with normalized format if not found
+        if (phoneError || !businessByPhone) {
+          const normalizedPhone = normalizePhoneNumber(payerPhone);
+          const phoneVariants = [
+            payerPhone,
+            '0' + payerPhone.slice(-9),
+            payerPhone.replace(/^972/, '0'),
+            '+972' + payerPhone.slice(-9)
+          ];
+          
+          for (const phoneVariant of phoneVariants) {
+            const { data: biz, error: err } = await supabase
+              .from('businesses')
+              .select('id, name, email')
+              .eq('phone', phoneVariant)
+              .single();
+            
+            if (!err && biz) {
+              businessByPhone = biz;
+              break;
+            }
+          }
+        }
+        
+        if (businessByPhone) {
           console.log('✅ Found business by phone instead:', businessByPhone.name);
-          return await processSubscription(businessByPhone, req.body, res);
+          return await processSubscription(businessByPhone, { plan, billingCycle, amount, transactionCode }, res);
         }
       }
       
-      return res.status(404).json({ error: 'Business not found', email });
+      return res.status(404).json({ error: 'Business not found', email: payerEmail });
     }
 
     console.log('✅ Found business:', business.name);
-    return await processSubscription(business, req.body, res);
+    return await processSubscription(business, { plan, billingCycle, amount, transactionCode }, res);
 
   } catch (error) {
     console.error('❌ Webhook error:', error);
@@ -592,11 +641,10 @@ app.post('/api/webhooks/grow', async (req, res) => {
  * Process subscription update
  */
 async function processSubscription(business, paymentData, res) {
-  const { plan, billing_cycle, amount, payment_id } = paymentData;
+  const { plan, billingCycle, amount, transactionCode } = paymentData;
   
   // Normalize plan name
   const planType = plan.toLowerCase().trim();
-  const billingCycle = billing_cycle === 'yearly' || billing_cycle === 'annual' ? 'yearly' : 'monthly';
   
   // Calculate period dates
   const now = new Date();
@@ -630,7 +678,7 @@ async function processSubscription(business, paymentData, res) {
         trial_ends_at: null, // Clear trial
         cancelled_at: null,
         cancel_reason: null,
-        external_subscription_id: payment_id || null,
+        external_subscription_id: transactionCode || null,
         updated_at: now.toISOString()
       })
       .eq('id', existingSub.id)
@@ -655,7 +703,7 @@ async function processSubscription(business, paymentData, res) {
         current_period_end: periodEnd.toISOString(),
         trial_starts_at: null,
         trial_ends_at: null,
-        external_subscription_id: payment_id || null
+        external_subscription_id: transactionCode || null
       })
       .select()
       .single();
