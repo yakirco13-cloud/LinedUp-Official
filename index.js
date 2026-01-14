@@ -1,5 +1,5 @@
 /**
- * LinedUp WhatsApp Service v2.1
+ * LinedUp WhatsApp Service v2.2
  * 
  * Features:
  * - OTP Authentication (send & verify)
@@ -8,7 +8,8 @@
  * - Automated reminders
  * - Waiting list notifications
  * - Broadcast messages
- * - ICS Calendar Feed (NEW!)
+ * - ICS Calendar Feed
+ * - Grow Payment Webhooks (NEW!)
  * 
  * Connects to: Supabase (not Base44)
  * Provider: Twilio WhatsApp API
@@ -249,7 +250,7 @@ async function sendOTPWhatsApp(to, otp) {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '2.1.0',
+    version: '2.2.0',
     timestamp: new Date().toISOString(),
     supabase: !!SUPABASE_URL,
     twilio: !!TWILIO_CONFIG.accountSid
@@ -498,6 +499,231 @@ app.post('/api/send-broadcast', async (req, res) => {
     res.json({ success: true, sent: successCount, failed: failCount });
   } catch (error) {
     console.error('❌ Error sending broadcast:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// GROW PAYMENT WEBHOOK (via Make.com)
+// ============================================================
+
+/**
+ * Webhook endpoint for Grow payments
+ * POST /api/webhooks/grow
+ * 
+ * Expected payload from Make.com:
+ * {
+ *   "email": "customer@email.com",
+ *   "phone": "0541234567",
+ *   "full_name": "שם הלקוח",
+ *   "business_name": "שם העסק",
+ *   "amount": 490,
+ *   "plan": "pro",           // starter, pro, or premium
+ *   "billing_cycle": "yearly", // monthly or yearly
+ *   "payment_id": "grow_xxx",
+ *   "status": "completed"
+ * }
+ */
+app.post('/api/webhooks/grow', async (req, res) => {
+  console.log('💳 Grow webhook received:', JSON.stringify(req.body, null, 2));
+  
+  const { 
+    email, 
+    phone,
+    full_name,
+    business_name,
+    amount, 
+    plan, 
+    billing_cycle, 
+    payment_id,
+    status 
+  } = req.body;
+
+  // Validate required fields
+  if (!email || !plan) {
+    console.error('❌ Missing required fields');
+    return res.status(400).json({ error: 'Missing required fields: email, plan' });
+  }
+
+  // Only process completed payments
+  if (status && status !== 'completed') {
+    console.log('⏭️ Skipping non-completed payment:', status);
+    return res.json({ success: true, message: 'Skipped non-completed payment' });
+  }
+
+  try {
+    // Find business by email
+    const { data: business, error: businessError } = await supabase
+      .from('businesses')
+      .select('id, name, email')
+      .eq('email', email.toLowerCase().trim())
+      .single();
+
+    if (businessError || !business) {
+      console.error('❌ Business not found for email:', email);
+      
+      // Try to find by phone as fallback
+      if (phone) {
+        const { data: businessByPhone, error: phoneError } = await supabase
+          .from('businesses')
+          .select('id, name, email')
+          .eq('phone', phone)
+          .single();
+        
+        if (!phoneError && businessByPhone) {
+          console.log('✅ Found business by phone instead:', businessByPhone.name);
+          return await processSubscription(businessByPhone, req.body, res);
+        }
+      }
+      
+      return res.status(404).json({ error: 'Business not found', email });
+    }
+
+    console.log('✅ Found business:', business.name);
+    return await processSubscription(business, req.body, res);
+
+  } catch (error) {
+    console.error('❌ Webhook error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Process subscription update
+ */
+async function processSubscription(business, paymentData, res) {
+  const { plan, billing_cycle, amount, payment_id } = paymentData;
+  
+  // Normalize plan name
+  const planType = plan.toLowerCase().trim();
+  const billingCycle = billing_cycle === 'yearly' || billing_cycle === 'annual' ? 'yearly' : 'monthly';
+  
+  // Calculate period dates
+  const now = new Date();
+  const periodEnd = new Date(now);
+  if (billingCycle === 'yearly') {
+    periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+  } else {
+    periodEnd.setMonth(periodEnd.getMonth() + 1);
+  }
+
+  // Check if subscription exists
+  const { data: existingSub, error: subError } = await supabase
+    .from('subscriptions')
+    .select('id')
+    .eq('business_id', business.id)
+    .single();
+
+  let result;
+  
+  if (existingSub) {
+    // Update existing subscription
+    const { data, error } = await supabase
+      .from('subscriptions')
+      .update({
+        plan_type: planType,
+        billing_cycle: billingCycle,
+        price_per_cycle: amount || null,
+        status: 'active',
+        current_period_start: now.toISOString(),
+        current_period_end: periodEnd.toISOString(),
+        trial_ends_at: null, // Clear trial
+        cancelled_at: null,
+        cancel_reason: null,
+        external_subscription_id: payment_id || null,
+        updated_at: now.toISOString()
+      })
+      .eq('id', existingSub.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    result = data;
+    console.log('✅ Subscription updated:', result.id);
+    
+  } else {
+    // Create new subscription
+    const { data, error } = await supabase
+      .from('subscriptions')
+      .insert({
+        business_id: business.id,
+        plan_type: planType,
+        billing_cycle: billingCycle,
+        price_per_cycle: amount || null,
+        status: 'active',
+        current_period_start: now.toISOString(),
+        current_period_end: periodEnd.toISOString(),
+        trial_starts_at: null,
+        trial_ends_at: null,
+        external_subscription_id: payment_id || null
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    result = data;
+    console.log('✅ Subscription created:', result.id);
+  }
+
+  res.json({ 
+    success: true, 
+    subscription_id: result.id,
+    business_id: business.id,
+    plan: planType,
+    status: 'active',
+    period_end: periodEnd.toISOString()
+  });
+}
+
+// ============================================================
+// SUBSCRIPTION STATUS CHECK ENDPOINT
+// ============================================================
+
+/**
+ * Check subscription status
+ * GET /api/subscription/:businessId
+ */
+app.get('/api/subscription/:businessId', async (req, res) => {
+  const { businessId } = req.params;
+  
+  try {
+    const { data, error } = await supabase
+      .from('subscriptions')
+      .select('*')
+      .eq('business_id', businessId)
+      .single();
+
+    if (error || !data) {
+      return res.json({ 
+        plan: 'free', 
+        status: 'none',
+        message: 'No subscription found' 
+      });
+    }
+
+    // Check if expired
+    const now = new Date();
+    const periodEnd = data.current_period_end ? new Date(data.current_period_end) : null;
+    const trialEnd = data.trial_ends_at ? new Date(data.trial_ends_at) : null;
+    
+    let effectiveStatus = data.status;
+    
+    if (data.status === 'trial' && trialEnd && now > trialEnd) {
+      effectiveStatus = 'expired';
+    } else if (data.status === 'active' && periodEnd && now > periodEnd) {
+      effectiveStatus = 'expired';
+    }
+
+    res.json({
+      plan: data.plan_type,
+      status: effectiveStatus,
+      billing_cycle: data.billing_cycle,
+      current_period_end: data.current_period_end,
+      trial_ends_at: data.trial_ends_at
+    });
+
+  } catch (error) {
+    console.error('❌ Error checking subscription:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -855,7 +1081,7 @@ function scheduleReminders() {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log('\n🚀 LinedUp WhatsApp Service v2.1 Started');
+  console.log('\n🚀 LinedUp WhatsApp Service v2.2 Started');
   console.log(`🌐 Server running on port ${PORT}`);
   console.log(`📡 Supabase: ${SUPABASE_URL}`);
   console.log(`📱 Twilio WhatsApp: ${TWILIO_CONFIG.whatsappNumber}`);
@@ -867,6 +1093,8 @@ app.listen(PORT, () => {
   console.log('   POST /api/send-update');
   console.log('   POST /api/send-waiting-list');
   console.log('   POST /api/send-broadcast');
+  console.log('   POST /api/webhooks/grow');
+  console.log('   GET  /api/subscription/:businessId');
   console.log('   GET  /cal/:businessId.ics');
   console.log('');
   
