@@ -540,31 +540,45 @@ app.post('/api/webhooks/grow', async (req, res) => {
     transactionCode
   } = req.body;
 
-  // Parse plan from paymentDesc (expected format: "pro-yearly", "starter-monthly", etc.)
-  let plan = 'pro';  // Default
-  let billingCycle = 'yearly';  // Default
+  // Determine plan and billing cycle from exact payment amount
+  const amount = parseFloat(paymentSum) || 0;
+  let plan = 'starter';  // Default
+  let billingCycle = 'monthly';  // Default
   
-  if (paymentDesc) {
+  // Yearly plans (one-time payments)
+  if (amount === 490) {
+    plan = 'starter';
+    billingCycle = 'yearly';
+  } else if (amount === 790) {
+    plan = 'pro';
+    billingCycle = 'yearly';
+  } else if (amount === 1290) {
+    plan = 'premium';
+    billingCycle = 'yearly';
+  }
+  // Monthly plans (recurring payments)
+  else if (amount === 49) {
+    plan = 'starter';
+    billingCycle = 'monthly';
+  } else if (amount === 79) {
+    plan = 'pro';
+    billingCycle = 'monthly';
+  } else if (amount === 129) {
+    plan = 'premium';
+    billingCycle = 'monthly';
+  }
+  // Fallback: try to parse from description if amount doesn't match
+  else if (paymentDesc) {
     const desc = paymentDesc.toLowerCase();
     
     // Extract plan
     if (desc.includes('premium')) plan = 'premium';
     else if (desc.includes('pro')) plan = 'pro';
     else if (desc.includes('starter')) plan = 'starter';
-    else if (desc.includes('free')) plan = 'free';
     
     // Extract billing cycle
     if (desc.includes('month') || desc.includes('חודש')) billingCycle = 'monthly';
     else if (desc.includes('year') || desc.includes('annual') || desc.includes('שנת')) billingCycle = 'yearly';
-  }
-  
-  // Also try to determine from amount if description doesn't help
-  const amount = parseFloat(paymentSum) || 0;
-  if (!paymentDesc || paymentDesc === 'TEST') {
-    // Guess plan from amount
-    if (amount >= 1290 || amount >= 129) plan = 'premium';
-    else if (amount >= 790 || amount >= 79) plan = 'pro';
-    else if (amount >= 490 || amount >= 49) plan = 'starter';
   }
 
   // Validate required fields
