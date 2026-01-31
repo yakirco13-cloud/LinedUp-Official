@@ -55,6 +55,7 @@ const TWILIO_CONFIG = {
   otpTemplateSid: process.env.TWILIO_OTP_TEMPLATE_SID || 'HX4f5f36cf2e136b35474c99890e2fc612',
   confirmationTemplateSid: process.env.TWILIO_CONFIRMATION_TEMPLATE_SID || 'HX833cc8141398f0a037c21e061404bba0',
   updateTemplateSid: process.env.TWILIO_UPDATE_TEMPLATE_SID || 'HXfb6f60eb9acb068d3100d204e8d866b9',
+  cancellationTemplateSid: process.env.TWILIO_CANCELLATION_TEMPLATE_SID || 'HXeddcd4ecea689861cde401d691666d7d',
   waitingListTemplateSid: process.env.TWILIO_WAITING_LIST_TEMPLATE_SID || 'HXd75dea9bfaea32988c7532ecc6969b34',
   broadcastTemplateSid: process.env.TWILIO_BROADCAST_TEMPLATE_SID || 'HXd94763214416ec4100848e81162aad92',
 };
@@ -393,13 +394,11 @@ app.post('/api/send-cancellation', async (req, res) => {
 
     const result = await sendWhatsAppMessage(
       phone,
-      TWILIO_CONFIG.updateTemplateSid,
+      TWILIO_CONFIG.cancellationTemplateSid,
       {
         "1": String(clientName || 'לקוח'),
         "2": String(serviceName || 'התור'),
-        "3": "בוטל",
-        "4": String(formattedDate || ''),
-        "5": ""
+        "3": String(formattedDate || '')
       }
     );
 
