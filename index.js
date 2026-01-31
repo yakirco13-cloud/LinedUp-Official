@@ -368,6 +368,50 @@ app.post('/api/send-confirmation', async (req, res) => {
 });
 
 /**
+ * Send booking cancellation notification
+ * POST /api/send-cancellation
+ */
+app.post('/api/send-cancellation', async (req, res) => {
+  console.log('📥 Cancellation request:', req.body);
+
+  const { phone, clientName, serviceName, date } = req.body;
+
+  if (!phone) {
+    return res.status(400).json({ error: 'Missing phone number' });
+  }
+
+  try {
+    let formattedDate = '';
+
+    if (date) {
+      try {
+        formattedDate = format(parseISO(date), 'd.M.yyyy');
+      } catch (e) {
+        formattedDate = date;
+      }
+    }
+
+    const result = await sendWhatsAppMessage(
+      phone,
+      TWILIO_CONFIG.updateTemplateSid,
+      {
+        "1": String(clientName || 'לקוח'),
+        "2": String(serviceName || 'התור'),
+        "3": "בוטל",
+        "4": String(formattedDate || ''),
+        "5": ""
+      }
+    );
+
+    console.log('✅ Cancellation notification sent');
+    res.json({ success: true, messageSid: result.sid });
+  } catch (error) {
+    console.error('❌ Error sending cancellation:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * Send booking update/cancellation
  * POST /api/send-update
  */
@@ -1152,6 +1196,7 @@ app.listen(PORT, () => {
   console.log('   POST /api/otp/send');
   console.log('   POST /api/otp/verify');
   console.log('   POST /api/send-confirmation');
+  console.log('   POST /api/send-cancellation');
   console.log('   POST /api/send-update');
   console.log('   POST /api/send-waiting-list');
   console.log('   POST /api/send-broadcast');
