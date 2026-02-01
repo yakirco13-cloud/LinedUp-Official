@@ -71,6 +71,7 @@ if (!TWILIO_CONFIG.accountSid || !TWILIO_CONFIG.authToken || !TWILIO_CONFIG.what
 // ============================================================
 
 const otpStore = new Map();
+const verifiedPhones = new Map(); // Stores phones that have verified OTP for password reset
 const OTP_EXPIRY_MINUTES = 10;
 
 /**
@@ -99,34 +100,49 @@ function storeOTP(phone, otp) {
 
 /**
  * Verify OTP
+ * @param {boolean} keepVerified - If true, store verification status for password reset
  */
-function verifyOTP(phone, code) {
+function verifyOTP(phone, code, keepVerified = false) {
   const normalizedPhone = normalizePhoneNumber(phone);
   const stored = otpStore.get(normalizedPhone);
-  
+
   if (!stored) {
     return { valid: false, error: 'OTP not found or expired' };
   }
-  
+
   if (Date.now() > stored.expiresAt) {
     otpStore.delete(normalizedPhone);
     return { valid: false, error: 'OTP expired' };
   }
-  
+
   // Rate limiting - max 5 attempts
   if (stored.attempts >= 5) {
     otpStore.delete(normalizedPhone);
     return { valid: false, error: 'Too many attempts' };
   }
-  
+
   stored.attempts++;
-  
+
   if (stored.code !== code) {
     return { valid: false, error: 'Invalid OTP' };
   }
-  
-  // Success - remove OTP
+
+  // Success - remove OTP but optionally mark as verified for password reset
   otpStore.delete(normalizedPhone);
+
+  if (keepVerified) {
+    // Store verification status for 10 minutes to allow password reset
+    verifiedPhones.set(normalizedPhone, {
+      verifiedAt: Date.now(),
+      expiresAt: Date.now() + (10 * 60 * 1000) // 10 minutes
+    });
+
+    // Auto-cleanup
+    setTimeout(() => {
+      verifiedPhones.delete(normalizedPhone);
+    }, 10 * 60 * 1000);
+  }
+
   return { valid: true };
 }
 
@@ -301,21 +317,108 @@ app.post('/api/otp/send', async (req, res) => {
  */
 app.post('/api/otp/verify', async (req, res) => {
   console.log('📥 OTP verify request:', req.body);
-  
-  const { phone, code } = req.body;
-  
+
+  const { phone, code, forPasswordReset } = req.body;
+
   if (!phone || !code) {
     return res.status(400).json({ error: 'Phone and code are required' });
   }
-  
-  const result = verifyOTP(phone, code);
-  
+
+  // If this is for password reset, keep the verification status
+  const result = verifyOTP(phone, code, forPasswordReset === true);
+
   if (result.valid) {
-    console.log('✅ OTP verified successfully');
+    console.log('✅ OTP verified successfully', forPasswordReset ? '(for password reset)' : '');
     res.json({ success: true, verified: true });
   } else {
     console.log('❌ OTP verification failed:', result.error);
     res.status(400).json({ success: false, error: result.error });
+  }
+});
+
+// ============================================================
+// PASSWORD RESET ENDPOINT
+// ============================================================
+
+/**
+ * Reset user password
+ * POST /api/reset-password
+ * Body: { email: "xxx@phone.linedup.app", newPassword: "newpass", userId: "uuid" }
+ *
+ * Uses Supabase Admin API to update the user's password
+ */
+app.post('/api/reset-password', async (req, res) => {
+  console.log('📥 Password reset request:', { email: req.body.email, userId: req.body.userId });
+
+  const { email, newPassword, userId } = req.body;
+
+  if (!email || !newPassword || !userId) {
+    return res.status(400).json({ error: 'Missing required fields: email, newPassword, userId' });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+
+  // Extract phone number from email (format: 972xxx@phone.linedup.app)
+  const phoneMatch = email.match(/^(\d+)@phone\.linedup\.app$/);
+  if (!phoneMatch) {
+    return res.status(400).json({ error: 'Invalid email format' });
+  }
+
+  const phoneFromEmail = phoneMatch[1];
+
+  // SECURITY: Verify that this phone number was recently verified via OTP
+  const verification = verifiedPhones.get(phoneFromEmail);
+  if (!verification) {
+    console.error('❌ Phone not verified for password reset:', phoneFromEmail);
+    return res.status(403).json({ error: 'Phone number not verified. Please verify OTP first.' });
+  }
+
+  if (Date.now() > verification.expiresAt) {
+    verifiedPhones.delete(phoneFromEmail);
+    console.error('❌ Verification expired for phone:', phoneFromEmail);
+    return res.status(403).json({ error: 'Verification expired. Please verify OTP again.' });
+  }
+
+  try {
+    // Use Supabase Admin API to update the user's password
+    // First, we need to find the auth user by their email
+    const { data: { users }, error: listError } = await supabase.auth.admin.listUsers();
+
+    if (listError) {
+      console.error('❌ Error listing users:', listError);
+      throw listError;
+    }
+
+    // Find user by email
+    const authUser = users.find(u => u.email === email);
+
+    if (!authUser) {
+      console.error('❌ Auth user not found for email:', email);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Update the password using admin API
+    const { error: updateError } = await supabase.auth.admin.updateUserById(
+      authUser.id,
+      { password: newPassword }
+    );
+
+    if (updateError) {
+      console.error('❌ Error updating password:', updateError);
+      throw updateError;
+    }
+
+    // Clear the verification after successful password reset
+    verifiedPhones.delete(phoneFromEmail);
+
+    console.log('✅ Password reset successful for user:', authUser.id);
+    res.json({ success: true, message: 'Password updated successfully' });
+
+  } catch (error) {
+    console.error('❌ Password reset error:', error);
+    res.status(500).json({ error: error.message || 'Failed to reset password' });
   }
 });
 
@@ -1194,6 +1297,7 @@ app.listen(PORT, () => {
   console.log('   GET  /health');
   console.log('   POST /api/otp/send');
   console.log('   POST /api/otp/verify');
+  console.log('   POST /api/reset-password');
   console.log('   POST /api/send-confirmation');
   console.log('   POST /api/send-cancellation');
   console.log('   POST /api/send-update');
