@@ -51,7 +51,7 @@ const TWILIO_CONFIG = {
   accountSid: process.env.TWILIO_ACCOUNT_SID,
   authToken: process.env.TWILIO_AUTH_TOKEN,
   whatsappNumber: process.env.TWILIO_WHATSAPP_NUMBER,
-  templateSid: process.env.TWILIO_TEMPLATE_SID, // For reminders
+  templateSid: process.env.TWILIO_TEMPLATE_SID || 'HX50b959eb4166c4c2fbea9ccf4194badc',
   otpTemplateSid: process.env.TWILIO_OTP_TEMPLATE_SID || 'HX4f5f36cf2e136b35474c99890e2fc612',
   confirmationTemplateSid: process.env.TWILIO_CONFIRMATION_TEMPLATE_SID || 'HX833cc8141398f0a037c21e061404bba0',
   updateTemplateSid: process.env.TWILIO_UPDATE_TEMPLATE_SID || 'HXfb6f60eb9acb068d3100d204e8d866b9',
