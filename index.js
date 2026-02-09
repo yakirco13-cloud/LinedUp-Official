@@ -1176,8 +1176,13 @@ async function fetchBookings(businessId) {
  * Process reminders for a business
  */
 async function processBusinessReminders(business) {
+  // Skip businesses with reminders disabled
+  if (business.reminder_enabled === false) {
+    return { business: business.name, sent: 0 };
+  }
+
   const reminderHours = business.reminder_hours_before || 12;
-  
+
   console.log(`\n📋 Processing reminders for: ${business.name} (${reminderHours}h before)`);
   
   const bookings = await fetchBookings(business.id);
@@ -1206,13 +1211,16 @@ async function processBusinessReminders(business) {
     const reminderKey = `${booking.id}-${booking.date}-${booking.time}`;
     if (sentReminders.has(reminderKey)) continue;
     
-    console.log(`   📤 Sending to ${booking.client_name}`);
-    
+    console.log(`   📤 Sending to ${booking.client_name} (phone: ${booking.client_phone})`);
+    console.log(`   📋 Template SID: "${TWILIO_CONFIG.templateSid}"`);
+
     try {
       const formattedDate = format(parseISO(booking.date), 'd בMMMM', { locale: he });
       // Format time as HH:MM (remove seconds if present)
       const formattedTime = booking.time.substring(0, 5);
-      
+
+      console.log(`   📋 Variables: name="${booking.client_name}", biz="${business.name}", date="${formattedDate}", time="${formattedTime}"`);
+
       await sendWhatsAppMessage(
         booking.client_phone,
         TWILIO_CONFIG.templateSid,
