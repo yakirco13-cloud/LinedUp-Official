@@ -19,7 +19,7 @@ import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
-import { format, parseISO, differenceInMinutes } from 'date-fns';
+import { format, parseISO } from 'date-fns';
 import { he } from 'date-fns/locale';
 
 // Set timezone to Israel
@@ -1124,170 +1124,209 @@ function formatICSDate(date) {
 }
 
 // ============================================================
-// AUTOMATED REMINDERS (from Supabase)
+// AUTOMATED REMINDERS — Fixed Schedule (Israel Time)
+// 18:00 → reminders for tomorrow 07:00–12:00
+// 08:00 → reminders for today 12:01–23:59
 // ============================================================
 
-// Track sent reminders to avoid duplicates
+// Track sent reminders to avoid duplicates (cleared daily)
 const sentReminders = new Set();
+let lastCleanupDate = '';
 
 /**
- * Fetch businesses from Supabase
+ * Fetch businesses with reminders enabled
  */
-async function fetchBusinesses() {
+async function fetchReminderBusinesses() {
   const { data, error } = await supabase
     .from('businesses')
-    .select('*');
-  
+    .select('id, name, reminder_enabled')
+    .eq('reminder_enabled', true);
+
   if (error) {
     console.error('Error fetching businesses:', error);
     return [];
   }
-  
+
   return data || [];
 }
 
 /**
- * Fetch upcoming bookings for a business
+ * Fetch confirmed bookings for a business on a specific date within a time range
  */
-async function fetchBookings(businessId) {
-  const now = new Date();
-  const todayStr = now.toISOString().split('T')[0];
-  const in48Hours = new Date(now.getTime() + 48 * 60 * 60 * 1000);
-  const in48HoursStr = in48Hours.toISOString().split('T')[0];
-  
-  const { data, error } = await supabase
+async function fetchBookingsForTimeRange(businessId, dateStr, startTime, endTime) {
+  let query = supabase
     .from('bookings')
     .select('*')
     .eq('business_id', businessId)
     .eq('status', 'confirmed')
-    .gte('date', todayStr)
-    .lte('date', in48HoursStr)
-    .not('client_phone', 'is', null);
-  
+    .eq('date', dateStr)
+    .not('client_phone', 'is', null)
+    .gte('time', startTime);
+
+  if (endTime) {
+    query = query.lte('time', endTime);
+  }
+
+  const { data, error } = await query;
+
   if (error) {
     console.error('Error fetching bookings:', error);
     return [];
   }
-  
+
   return data || [];
 }
 
 /**
- * Process reminders for a business
+ * Send reminder for a single booking
  */
-async function processBusinessReminders(business) {
-  // Skip businesses with reminders disabled
-  if (business.reminder_enabled === false) {
-    return { business: business.name, sent: 0 };
+async function sendBookingReminder(booking, business) {
+  const reminderKey = `${booking.id}-${booking.date}`;
+  if (sentReminders.has(reminderKey)) return false;
+
+  try {
+    const formattedDate = format(parseISO(booking.date), 'd בMMMM', { locale: he });
+    const formattedTime = booking.time.substring(0, 5);
+
+    console.log(`   📤 Sending to ${booking.client_name} (${booking.client_phone}) — ${formattedDate} ${formattedTime}`);
+
+    await sendWhatsAppMessage(
+      booking.client_phone,
+      TWILIO_CONFIG.templateSid,
+      {
+        "1": booking.client_name || 'לקוח יקר',
+        "2": business.name,
+        "3": formattedDate,
+        "4": formattedTime
+      }
+    );
+
+    sentReminders.add(reminderKey);
+    return true;
+  } catch (error) {
+    console.error(`   ❌ Failed to send to ${booking.client_name}:`, error.message);
+    return false;
   }
-
-  const reminderHours = business.reminder_hours_before || 12;
-
-  console.log(`\n📋 Processing reminders for: ${business.name} (${reminderHours}h before)`);
-  
-  const bookings = await fetchBookings(business.id);
-  
-  if (bookings.length === 0) {
-    console.log('   No upcoming bookings');
-    return { business: business.name, sent: 0 };
-  }
-  
-  console.log(`   Found ${bookings.length} upcoming booking(s)`);
-  
-  let sentCount = 0;
-  const now = new Date();
-  
-  for (const booking of bookings) {
-    const bookingDateTime = new Date(`${booking.date}T${booking.time}+02:00`);
-    const minutesUntil = differenceInMinutes(bookingDateTime, now);
-    
-    // Send if within ±10 minutes of target reminder time
-    const targetMinutes = reminderHours * 60;
-    const shouldSend = minutesUntil >= (targetMinutes - 10) && minutesUntil <= (targetMinutes + 10);
-    
-    if (!shouldSend) continue;
-    
-    // Check if already sent
-    const reminderKey = `${booking.id}-${booking.date}-${booking.time}`;
-    if (sentReminders.has(reminderKey)) continue;
-    
-    console.log(`   📤 Sending to ${booking.client_name} (phone: ${booking.client_phone})`);
-    console.log(`   📋 Template SID: "${TWILIO_CONFIG.templateSid}"`);
-
-    try {
-      const formattedDate = format(parseISO(booking.date), 'd בMMMM', { locale: he });
-      // Format time as HH:MM (remove seconds if present)
-      const formattedTime = booking.time.substring(0, 5);
-
-      console.log(`   📋 Variables: name="${booking.client_name}", biz="${business.name}", date="${formattedDate}", time="${formattedTime}"`);
-
-      await sendWhatsAppMessage(
-        booking.client_phone,
-        TWILIO_CONFIG.templateSid,
-        {
-          "1": booking.client_name || 'לקוח יקר',
-          "2": business.name,
-          "3": formattedDate,
-          "4": formattedTime
-        }
-      );
-      
-      sentReminders.add(reminderKey);
-      sentCount++;
-    } catch (error) {
-      console.error(`   ❌ Failed to send to ${booking.client_name}:`, error.message);
-    }
-  }
-  
-  return { business: business.name, sent: sentCount };
 }
 
 /**
- * Check and send reminders for all businesses
+ * Run the reminder job for either the 08:00 or 18:00 window
+ * @param {'morning' | 'evening'} runType
  */
-async function checkAndSendReminders() {
+async function runReminderJob(runType) {
+  const now = new Date();
+  const todayStr = format(now, 'yyyy-MM-dd');
+
+  // Clean up sentReminders set once per day
+  if (lastCleanupDate !== todayStr) {
+    sentReminders.clear();
+    lastCleanupDate = todayStr;
+    console.log('🧹 Cleared sentReminders for new day');
+  }
+
+  let targetDate, startTime, endTime, label;
+
+  if (runType === 'evening') {
+    // 18:00 run → tomorrow's bookings from 07:00 to 12:00
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    targetDate = format(tomorrow, 'yyyy-MM-dd');
+    startTime = '07:00';
+    endTime = '12:00';
+    label = `tomorrow (${targetDate}) 07:00–12:00`;
+  } else {
+    // 08:00 run → today's bookings from 12:01 to 23:59
+    targetDate = todayStr;
+    startTime = '12:01';
+    endTime = '23:59';
+    label = `today (${targetDate}) 12:01–23:59`;
+  }
+
   console.log('\n' + '='.repeat(60));
-  console.log(`🔔 Reminder Check: ${new Date().toISOString()}`);
+  console.log(`🔔 Reminder Run (${runType}): ${now.toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' })}`);
+  console.log(`📅 Sending reminders for bookings: ${label}`);
   console.log('='.repeat(60));
-  
+
   try {
-    const businesses = await fetchBusinesses();
-    console.log(`Found ${businesses.length} business(es)`);
-    
+    const businesses = await fetchReminderBusinesses();
+    console.log(`Found ${businesses.length} business(es) with reminders enabled`);
+
     let totalSent = 0;
-    
+
     for (const business of businesses) {
-      const result = await processBusinessReminders(business);
-      totalSent += result.sent;
+      console.log(`\n📋 ${business.name}:`);
+      const bookings = await fetchBookingsForTimeRange(business.id, targetDate, startTime, endTime);
+
+      if (bookings.length === 0) {
+        console.log('   No bookings in this window');
+        continue;
+      }
+
+      console.log(`   Found ${bookings.length} booking(s)`);
+
+      for (const booking of bookings) {
+        const sent = await sendBookingReminder(booking, business);
+        if (sent) totalSent++;
+      }
     }
-    
+
     console.log(`\n📊 Total reminders sent: ${totalSent}`);
     console.log('='.repeat(60) + '\n');
   } catch (error) {
-    console.error('❌ Error in reminder check:', error);
+    console.error('❌ Error in reminder job:', error);
   }
 }
 
 /**
- * Schedule reminder checks at :00, :15, :30, :45
+ * Calculate milliseconds until the next target hour (Israel time)
+ * Target hours: 08:00 and 18:00
+ */
+function getNextRunInfo() {
+  const now = new Date();
+  const currentHour = now.getHours();
+  const currentMinute = now.getMinutes();
+  const currentTime = currentHour + currentMinute / 60;
+
+  let nextHour, runType;
+
+  if (currentTime < 8) {
+    // Before 08:00 → next run is 08:00 today
+    nextHour = 8;
+    runType = 'morning';
+  } else if (currentTime < 18) {
+    // Between 08:00 and 18:00 → next run is 18:00 today
+    nextHour = 18;
+    runType = 'evening';
+  } else {
+    // After 18:00 → next run is 08:00 tomorrow
+    nextHour = 8 + 24; // will be handled below
+    runType = 'morning';
+  }
+
+  const target = new Date(now);
+  target.setHours(nextHour % 24, 0, 0, 0);
+  if (nextHour >= 24) {
+    target.setDate(target.getDate() + 1);
+  }
+
+  const msUntil = target.getTime() - now.getTime();
+  return { msUntil, runType, target };
+}
+
+/**
+ * Schedule the next reminder run and chain subsequent ones
  */
 function scheduleReminders() {
-  // Run immediately on start
-  checkAndSendReminders();
-  
-  // Calculate time until next 15-minute mark
-  const now = new Date();
-  const minutes = now.getMinutes();
-  const nextSlot = Math.ceil((minutes + 1) / 15) * 15;
-  const msUntilNext = ((nextSlot - minutes) * 60 * 1000) - (now.getSeconds() * 1000);
-  
-  setTimeout(() => {
-    checkAndSendReminders();
-    // Then run every 15 minutes
-    setInterval(checkAndSendReminders, 15 * 60 * 1000);
-  }, msUntilNext);
-  
-  console.log(`⏰ Next reminder check in ${Math.round(msUntilNext / 1000 / 60)} minutes`);
+  const { msUntil, runType, target } = getNextRunInfo();
+  const minutesUntil = Math.round(msUntil / 1000 / 60);
+
+  console.log(`⏰ Next reminder run: ${runType} at ${target.toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' })} (in ${minutesUntil} min)`);
+
+  setTimeout(async () => {
+    await runReminderJob(runType);
+    // After running, schedule the next one
+    scheduleReminders();
+  }, msUntil);
 }
 
 // ============================================================
