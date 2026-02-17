@@ -383,20 +383,18 @@ app.post('/api/reset-password', async (req, res) => {
 
   try {
     // Use Supabase Admin API to update the user's password
-    // First, we need to find the auth user by their email
-    const { data: { users }, error: listError } = await supabase.auth.admin.listUsers();
+    // Look up auth user by their profile's auth_user_id (userId)
+    const { data: { user: authUser }, error: getUserError } = await supabase.auth.admin.getUserById(userId);
 
-    if (listError) {
-      console.error('❌ Error listing users:', listError);
-      throw listError;
+    if (getUserError || !authUser) {
+      console.error('❌ Auth user not found for userId:', userId);
+      return res.status(404).json({ error: 'User not found' });
     }
 
-    // Find user by email
-    const authUser = users.find(u => u.email === email);
-
-    if (!authUser) {
-      console.error('❌ Auth user not found for email:', email);
-      return res.status(404).json({ error: 'User not found' });
+    // Verify the email matches for security
+    if (authUser.email !== email) {
+      console.error('❌ Email mismatch:', authUser.email, '!==', email);
+      return res.status(403).json({ error: 'Email mismatch' });
     }
 
     // Update the password using admin API
