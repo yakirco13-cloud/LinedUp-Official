@@ -99,8 +99,39 @@ function isDemoAccount(phone) {
 // ============================================================
 
 const otpStore = new Map();
-const verifiedPhones = new Map(); // Stores phones that have verified OTP for password reset
 const OTP_EXPIRY_MINUTES = 10;
+const VERIFICATION_MINUTES = 10;
+
+/**
+ * Proof that a phone passed OTP, used to authorise a password reset.
+ *
+ * This lives in Postgres rather than in a Map because the process memory is
+ * wiped by every restart and deploy — a user who verified their OTP seconds
+ * before a redeploy was told "Phone number not verified", with no way to tell
+ * why. It also means the reset can be served by a different instance than the
+ * one that handled the OTP.
+ */
+async function markPhoneVerified(normalizedPhone) {
+  const expiresAt = new Date(Date.now() + VERIFICATION_MINUTES * 60 * 1000);
+  const { error } = await supabase
+    .from('phone_verifications')
+    .upsert({ phone: normalizedPhone, verified_at: new Date().toISOString(), expires_at: expiresAt.toISOString() });
+  if (error) throw error;
+}
+
+async function getPhoneVerification(normalizedPhone) {
+  const { data, error } = await supabase
+    .from('phone_verifications')
+    .select('phone, expires_at')
+    .eq('phone', normalizedPhone)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function clearPhoneVerification(normalizedPhone) {
+  await supabase.from('phone_verifications').delete().eq('phone', normalizedPhone);
+}
 
 /**
  * Generate a 6-digit OTP
@@ -130,7 +161,7 @@ function storeOTP(phone, otp) {
  * Verify OTP
  * @param {boolean} keepVerified - If true, store verification status for password reset
  */
-function verifyOTP(phone, code, keepVerified = false) {
+async function verifyOTP(phone, code, keepVerified = false) {
   const normalizedPhone = normalizePhoneNumber(phone);
   const stored = otpStore.get(normalizedPhone);
 
@@ -159,16 +190,8 @@ function verifyOTP(phone, code, keepVerified = false) {
   otpStore.delete(normalizedPhone);
 
   if (keepVerified) {
-    // Store verification status for 10 minutes to allow password reset
-    verifiedPhones.set(normalizedPhone, {
-      verifiedAt: Date.now(),
-      expiresAt: Date.now() + (10 * 60 * 1000) // 10 minutes
-    });
-
-    // Auto-cleanup
-    setTimeout(() => {
-      verifiedPhones.delete(normalizedPhone);
-    }, 10 * 60 * 1000);
+    // Persisted, so a restart between the OTP and the reset doesn't lose it
+    await markPhoneVerified(normalizedPhone);
   }
 
   return { valid: true };
@@ -360,7 +383,7 @@ app.post('/api/otp/verify', async (req, res) => {
   }
 
   // If this is for password reset, keep the verification status
-  const result = verifyOTP(phone, code, forPasswordReset === true);
+  const result = await verifyOTP(phone, code, forPasswordReset === true);
 
   if (result.valid) {
     console.log('✅ OTP verified successfully', forPasswordReset ? '(for password reset)' : '');
@@ -395,27 +418,6 @@ app.post('/api/reset-password', async (req, res) => {
     return res.status(400).json({ error: 'Password must be at least 6 characters' });
   }
 
-  // Extract phone number from email (format: 972xxx@phone.linedup.app)
-  const phoneMatch = email.match(/^(\d+)@phone\.linedup\.app$/);
-  if (!phoneMatch) {
-    return res.status(400).json({ error: 'Invalid email format' });
-  }
-
-  const phoneFromEmail = phoneMatch[1];
-
-  // SECURITY: Verify that this phone number was recently verified via OTP
-  const verification = verifiedPhones.get(phoneFromEmail);
-  if (!verification) {
-    console.error('❌ Phone not verified for password reset:', phoneFromEmail);
-    return res.status(403).json({ error: 'Phone number not verified. Please verify OTP first.' });
-  }
-
-  if (Date.now() > verification.expiresAt) {
-    verifiedPhones.delete(phoneFromEmail);
-    console.error('❌ Verification expired for phone:', phoneFromEmail);
-    return res.status(403).json({ error: 'Verification expired. Please verify OTP again.' });
-  }
-
   try {
     // Use Supabase Admin API to update the user's password
     // Look up auth user by their profile's auth_user_id (userId)
@@ -432,6 +434,36 @@ app.post('/api/reset-password', async (req, res) => {
       return res.status(403).json({ error: 'Email mismatch' });
     }
 
+    // The phone to check comes from the profile, NOT from parsing the email.
+    // Business owners authenticate with a real email address, so the old
+    // "972xxx@phone.linedup.app" pattern never matched for them and every
+    // reset they attempted was rejected.
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('phone')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (profileError || !profile?.phone) {
+      console.error('❌ No profile/phone for userId:', userId, profileError);
+      return res.status(404).json({ error: 'Profile not found' });
+    }
+
+    const normalizedPhone = normalizePhoneNumber(profile.phone);
+
+    // SECURITY: the phone on this account must have passed OTP recently
+    const verification = await getPhoneVerification(normalizedPhone);
+    if (!verification) {
+      console.error('❌ Phone not verified for password reset:', normalizedPhone);
+      return res.status(403).json({ error: 'Phone number not verified. Please verify OTP first.' });
+    }
+
+    if (Date.now() > new Date(verification.expires_at).getTime()) {
+      await clearPhoneVerification(normalizedPhone);
+      console.error('❌ Verification expired for phone:', normalizedPhone);
+      return res.status(403).json({ error: 'Verification expired. Please verify OTP again.' });
+    }
+
     // Update the password using admin API
     const { error: updateError } = await supabase.auth.admin.updateUserById(
       authUser.id,
@@ -444,7 +476,7 @@ app.post('/api/reset-password', async (req, res) => {
     }
 
     // Clear the verification after successful password reset
-    verifiedPhones.delete(phoneFromEmail);
+    await clearPhoneVerification(normalizedPhone);
 
     console.log('✅ Password reset successful for user:', authUser.id);
     res.json({ success: true, message: 'Password updated successfully' });
